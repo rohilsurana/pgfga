@@ -12,7 +12,7 @@
   "dependencies": {
     "@arda/db": "workspace:*",
     "@arda/utils": "workspace:*",
-    "drizzle-orm": "0.40.0",
+    "drizzle-orm": "0.45.2",
     "postgres": "3.4.5",
     "prexit": "2.3.0",
     "zod": "3.23.8"
