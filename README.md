@@ -2,7 +2,11 @@
 
 pgFGA is a pure-Postgres fine-grained authorization library for Go, implementing parts of [OpenFGA](https://openfga.dev/). It parses `.fga` schema files natively using the [openfga/language](https://github.com/openfga/language) package — no external CLI or sidecar needed.
 
-Forked from [isaacharrisholt/pgfga](https://github.com/isaacharrisholt/pgfga) and rewritten in Go.
+## Credits
+
+This project is a Go rewrite of [pgFGA](https://github.com/isaacharrisholt/pgfga) by [Isaac Harris-Holt](https://github.com/isaacharrisholt). The original project implemented pgFGA using TypeScript/Bun and the OpenFGA CLI. This fork replaces those with a pure Go library using the [openfga/language](https://github.com/openfga/language) package for native DSL parsing. The core SQL — the `authz_model` table design and the recursive `check_permission` PL/pgSQL function — originates from the original project.
+
+Licensed under MIT. See [LICENSE](./LICENSE) for the full text.
 
 ## Requirements
 
