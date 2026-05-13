@@ -2,16 +2,14 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/rohilsurana/pgfga/internal/db"
-	"github.com/rohilsurana/pgfga/internal/parser"
-	"github.com/rohilsurana/pgfga/internal/schema"
-	"github.com/rohilsurana/pgfga/internal/transform"
+	"github.com/rohilsurana/pgfga"
+	"github.com/rohilsurana/pgfga/parser"
+	"github.com/rohilsurana/pgfga/transform"
 )
 
 func main() {
@@ -56,12 +54,75 @@ Environment:
 `)
 }
 
-func baseDir() string {
-	return "."
+// Schema directory helpers
+
+func getAllSchemaDirs() ([]string, error) {
+	entries, err := os.ReadDir("schemas")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() && !strings.Contains(e.Name(), "README") {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	return dirs, nil
 }
 
+type schemaVersion struct {
+	isWIP   bool
+	dirName string
+	number  int64
+}
+
+func getLatestVersion(filterWIP bool) (*schemaVersion, error) {
+	dirs, err := getAllSchemaDirs()
+	if err != nil {
+		return nil, err
+	}
+	if len(dirs) == 0 {
+		return nil, nil
+	}
+
+	hasWIP := false
+	for _, d := range dirs {
+		if d == "wip" {
+			hasWIP = true
+			break
+		}
+	}
+	if hasWIP && !filterWIP {
+		return &schemaVersion{isWIP: true, dirName: "wip"}, nil
+	}
+
+	var versioned []string
+	for _, d := range dirs {
+		if d != "wip" {
+			versioned = append(versioned, d)
+		}
+	}
+	if len(versioned) == 0 {
+		return nil, nil
+	}
+
+	latest := versioned[len(versioned)-1]
+	var num int64
+	fmt.Sscanf(strings.TrimPrefix(latest, "v"), "%d", &num)
+	return &schemaVersion{dirName: latest, number: num}, nil
+}
+
+func schemaFilePath(dirName string) string {
+	return filepath.Join("schemas", dirName, "schema.fga")
+}
+
+// Commands
+
 func cmdValidate() error {
-	dirs, err := schema.GetAllSchemaDirs(baseDir())
+	dirs, err := getAllSchemaDirs()
 	if err != nil {
 		return err
 	}
@@ -71,7 +132,7 @@ func cmdValidate() error {
 
 	allValid := true
 	for _, dir := range dirs {
-		path := schema.SchemaFilePath(baseDir(), dir)
+		path := schemaFilePath(dir)
 		if err := parser.ValidateFile(path); err != nil {
 			fmt.Fprintf(os.Stderr, "INVALID %s: %v\n", path, err)
 			allValid = false
@@ -79,7 +140,6 @@ func cmdValidate() error {
 			fmt.Printf("OK %s\n", path)
 		}
 	}
-
 	if !allValid {
 		return fmt.Errorf("some schemas are invalid")
 	}
@@ -88,20 +148,19 @@ func cmdValidate() error {
 }
 
 func cmdNew() error {
-	latest, err := schema.GetLatestVersion(baseDir(), false)
+	latest, err := getLatestVersion(false)
 	if err != nil {
 		return err
 	}
 	if latest == nil {
 		return fmt.Errorf("no existing schemas found")
 	}
-	if latest.IsWIP {
+	if latest.isWIP {
 		return fmt.Errorf("WIP schema already exists, finalize it first")
 	}
 
-	srcDir := filepath.Join(baseDir(), "schemas", latest.DirName)
-	dstDir := filepath.Join(baseDir(), "schemas", "wip")
-
+	srcDir := filepath.Join("schemas", latest.dirName)
+	dstDir := filepath.Join("schemas", "wip")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
@@ -123,23 +182,23 @@ func cmdNew() error {
 		}
 	}
 
-	fmt.Printf("created WIP schema from %s\n", latest.DirName)
+	fmt.Printf("created WIP schema from %s\n", latest.dirName)
 	return nil
 }
 
 func cmdFinalize() error {
-	latest, err := schema.GetLatestVersion(baseDir(), false)
+	latest, err := getLatestVersion(false)
 	if err != nil {
 		return err
 	}
 	if latest == nil {
 		return fmt.Errorf("no schemas found")
 	}
-	if !latest.IsWIP {
+	if !latest.isWIP {
 		return fmt.Errorf("no WIP schema to finalize")
 	}
 
-	current, err := schema.GetLatestVersion(baseDir(), true)
+	current, err := getLatestVersion(true)
 	if err != nil {
 		return err
 	}
@@ -147,9 +206,9 @@ func cmdFinalize() error {
 		return fmt.Errorf("no finalized schema found")
 	}
 
-	newVersion := fmt.Sprintf("v%03d", current.Number+1)
-	srcDir := filepath.Join(baseDir(), "schemas", "wip")
-	dstDir := filepath.Join(baseDir(), "schemas", newVersion)
+	newVersion := fmt.Sprintf("v%03d", current.number+1)
+	srcDir := filepath.Join("schemas", "wip")
+	dstDir := filepath.Join("schemas", newVersion)
 
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
@@ -192,26 +251,26 @@ func cmdMigrate() error {
 	}
 
 	isLocal := os.Getenv("PGFGA_LOCAL") == "true"
-
 	ctx := context.Background()
-	conn, err := db.Connect(dsn)
+
+	client, err := pgfga.Connect(dsn)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer client.Close()
 
-	if err := db.EnsureSchema(ctx, conn); err != nil {
-		return fmt.Errorf("ensure schema: %w", err)
+	if err := client.Migrate(ctx); err != nil {
+		return err
 	}
 
 	if isLocal {
-		return localMigrate(ctx, conn)
+		return localMigrate(ctx, client)
 	}
-	return nonLocalMigrate(ctx, conn)
+	return nonLocalMigrate(ctx, client)
 }
 
-func localMigrate(ctx context.Context, conn *sql.DB) error {
-	latest, err := schema.GetLatestVersion(baseDir(), false)
+func localMigrate(ctx context.Context, client *pgfga.Client) error {
+	latest, err := getLatestVersion(false)
 	if err != nil {
 		return err
 	}
@@ -219,46 +278,35 @@ func localMigrate(ctx context.Context, conn *sql.DB) error {
 		return fmt.Errorf("no schema versions found")
 	}
 
-	var versionToCreate int64
+	var version int64
 	var dirName string
 
-	if latest.IsWIP {
-		current, err := schema.GetLatestVersion(baseDir(), true)
+	if latest.isWIP {
+		current, err := getLatestVersion(true)
 		if err != nil {
 			return err
 		}
 		if current == nil {
 			return fmt.Errorf("no finalized schema found")
 		}
-		versionToCreate = current.Number + 1
+		version = current.number + 1
 		dirName = "wip"
 	} else {
-		versionToCreate = latest.Number
-		dirName = latest.DirName
+		version = latest.number
+		dirName = latest.dirName
 	}
 
-	rows, err := loadSchemaRows(versionToCreate, dirName)
-	if err != nil {
+	path := schemaFilePath(dirName)
+	if err := client.LoadModelFile(ctx, version, path); err != nil {
 		return err
 	}
 
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if err := db.DeleteSchemaVersion(ctx, tx, versionToCreate); err != nil {
-		return err
-	}
-	if err := db.InsertAuthzModel(ctx, tx, rows); err != nil {
-		return err
-	}
-	return tx.Commit()
+	fmt.Printf("migrated schema version %d (%s)\n", version, dirName)
+	return nil
 }
 
-func nonLocalMigrate(ctx context.Context, conn *sql.DB) error {
-	latest, err := schema.GetLatestVersion(baseDir(), true)
+func nonLocalMigrate(ctx context.Context, client *pgfga.Client) error {
+	latest, err := getLatestVersion(true)
 	if err != nil {
 		return err
 	}
@@ -266,52 +314,32 @@ func nonLocalMigrate(ctx context.Context, conn *sql.DB) error {
 		return fmt.Errorf("no finalized schema found")
 	}
 
-	dbVersion, err := db.GetLatestSchemaVersion(ctx, conn)
+	dbVersion, err := client.GetLatestSchemaVersion(ctx)
 	if err != nil {
 		return err
 	}
-
-	if dbVersion >= latest.Number {
+	if dbVersion >= latest.number {
 		fmt.Printf("database already at version %d, no migration needed\n", dbVersion)
 		return nil
 	}
 
-	rows, err := loadSchemaRows(latest.Number, latest.DirName)
-	if err != nil {
-		return err
-	}
-
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if err := db.InsertAuthzModel(ctx, tx, rows); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func loadSchemaRows(version int64, dirName string) ([]transform.AuthzModelRow, error) {
-	path := schema.SchemaFilePath(baseDir(), dirName)
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("schema file not found: %s", path)
-	}
-
+	path := schemaFilePath(latest.dirName)
 	model, err := parser.ParseFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return err
 	}
-
-	rows, err := transform.GenerateAuthzModel(version, model)
+	rows, err := transform.GenerateAuthzModel(latest.number, model)
 	if err != nil {
-		return nil, fmt.Errorf("transform %s: %w", path, err)
+		return err
 	}
-
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("no authz model rows generated from %s", path)
+		return fmt.Errorf("no model rows generated")
 	}
 
-	return rows, nil
+	if err := client.LoadModelFile(ctx, latest.number, path); err != nil {
+		return err
+	}
+
+	fmt.Printf("migrated schema version %d\n", latest.number)
+	return nil
 }

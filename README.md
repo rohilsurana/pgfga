@@ -2,37 +2,107 @@
 
 pgFGA is a pure-Postgres implementation of parts of [OpenFGA](https://openfga.dev/).
 
-This is a Go port of the original [pgFGA](https://github.com/isaacharrisholt/pgfga) project. It replaces the TypeScript/Bun scripts and the OpenFGA CLI dependency with a single Go binary that parses `.fga` files natively using the [openfga/language](https://github.com/openfga/language) package.
+This is a Go port of the original [pgFGA](https://github.com/isaacharrisholt/pgfga) project. It replaces the TypeScript/Bun scripts and the OpenFGA CLI dependency with a Go library and CLI that parses `.fga` files natively using the [openfga/language](https://github.com/openfga/language) package.
 
 ## Requirements
 
 - Go 1.25+
 - PostgreSQL database
 
-## Getting set up
+## Library Usage
 
-### Install the CLI
+```go
+import "github.com/rohilsurana/pgfga"
+```
+
+### Initialize
+
+```go
+// From an existing *sql.DB
+client := pgfga.New(db)
+
+// Or connect directly
+client, err := pgfga.Connect("postgres://user:pass@localhost:5432/mydb?sslmode=disable")
+if err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+```
+
+### Migrate (create tables + install PL/pgSQL functions)
+
+```go
+if err := client.Migrate(ctx); err != nil {
+    log.Fatal(err)
+}
+```
+
+This creates the `authz_model` table and installs the `check_permission` functions. Safe to call multiple times.
+
+### Load an authorization model
+
+```go
+// From a DSL string
+dsl := `model
+  schema 1.1
+
+type user
+
+type document
+  relations
+    define viewer: [user]
+    define editor: [user] or viewer
+`
+err := client.LoadModelDSL(ctx, 1, dsl)
+
+// Or from a .fga file
+err := client.LoadModelFile(ctx, 1, "schemas/v001/schema.fga")
+```
+
+### Check permissions
+
+```go
+allowed, err := client.Check(ctx, pgfga.CheckRequest{
+    UserType:   "user",
+    UserID:     "alice",
+    Relation:   "viewer",
+    ObjectType: "document",
+    ObjectID:   "doc-1",
+})
+
+// With explicit schema version
+allowed, err := client.CheckWithVersion(ctx, 1, pgfga.CheckRequest{
+    UserType:   "user",
+    UserID:     "alice",
+    Relation:   "viewer",
+    ObjectType: "document",
+    ObjectID:   "doc-1",
+})
+```
+
+### Sub-packages
+
+For advanced use, the parser and transform packages are importable directly:
+
+```go
+import (
+    "github.com/rohilsurana/pgfga/parser"
+    "github.com/rohilsurana/pgfga/transform"
+)
+
+model, err := parser.ParseFile("schema.fga")
+rows, err := transform.GenerateAuthzModel(1, model)
+```
+
+## CLI Usage
+
+### Install
 
 ```bash
 go install github.com/rohilsurana/pgfga/cmd/pgfga@latest
 ```
 
-Or build from source:
-
-```bash
-go build -o pgfga ./cmd/pgfga
-```
-
-### SQL files
-
-The [`pgfga`](./pgfga) directory contains the SQL you need:
-
-- `authz_model.sql` — DDL for the `authz_model` table (auto-created by `migrate`)
-- `check_permission.sql` — PL/pgSQL functions for checking permissions
-
-Run `check_permission.sql` in your database after the first migration.
-
-## CLI Usage
+### Commands
 
 ```
 pgfga validate              Validate all .fga schemas
@@ -55,22 +125,6 @@ pgfga migrate [--dsn=...]   Migrate the database to the latest schema version
 3. `pgfga validate` — check all schemas parse correctly
 4. `pgfga finalize` — promotes WIP to next version number
 5. `pgfga migrate --dsn=...` — applies the schema to the database
-
-## `check_permission`
-
-The `check_permission.sql` file provides three PL/pgSQL function overloads:
-
-```sql
--- With explicit schema version (recommended for production)
-check_permission(p_schema_version bigint, p_user_type text, p_user_id text,
-                 p_relation text, p_object_type text, p_object_id text)
-    returns boolean;
-
--- Uses latest schema version (convenient for development)
-check_permission(p_user_type text, p_user_id text,
-                 p_relation text, p_object_type text, p_object_id text)
-    returns boolean;
-```
 
 ## `authz_relationship` view
 

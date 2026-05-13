@@ -69,8 +69,23 @@ type repository
 	}
 }
 
+func TestValidateString(t *testing.T) {
+	valid := `model
+  schema 1.1
+
+type user
+
+type doc
+  relations
+    define viewer: [user]
+`
+	if err := ValidateString(valid); err != nil {
+		t.Errorf("expected valid schema, got: %v", err)
+	}
+}
+
 func TestValidateFile(t *testing.T) {
-	err := ValidateFile("../../schemas/v000/schema.fga")
+	err := ValidateFile("../schemas/v000/schema.fga")
 	if err != nil {
 		t.Fatalf("ValidateFile: %v", err)
 	}

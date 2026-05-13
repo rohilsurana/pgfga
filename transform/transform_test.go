@@ -3,7 +3,7 @@ package transform
 import (
 	"testing"
 
-	"github.com/rohilsurana/pgfga/internal/parser"
+	"github.com/rohilsurana/pgfga/parser"
 )
 
 func TestGenerateAuthzModel(t *testing.T) {
@@ -38,7 +38,6 @@ type organization
 		byRelation[r.Relation] = r
 	}
 
-	// owner: direct, subject_type=user
 	owner := byRelation["owner"]
 	if owner.SubjectType == nil || *owner.SubjectType != "user" {
 		t.Errorf("owner should have subject_type=user")
@@ -47,7 +46,6 @@ type organization
 		t.Errorf("owner should not have implied_by")
 	}
 
-	// admin: union, subject_type=user, implied_by=owner
 	admin := byRelation["admin"]
 	if admin.SubjectType == nil || *admin.SubjectType != "user" {
 		t.Errorf("admin should have subject_type=user")
@@ -56,7 +54,6 @@ type organization
 		t.Errorf("admin should have implied_by=owner")
 	}
 
-	// member: union, subject_type=user, implied_by=admin
 	member := byRelation["member"]
 	if member.SubjectType == nil || *member.SubjectType != "user" {
 		t.Errorf("member should have subject_type=user")
@@ -65,7 +62,6 @@ type organization
 		t.Errorf("member should have implied_by=admin")
 	}
 
-	// can_read: computed userset, implied_by=member
 	canRead := byRelation["can_read"]
 	if canRead.SubjectType != nil {
 		t.Errorf("can_read should not have subject_type")

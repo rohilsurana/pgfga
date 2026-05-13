@@ -24,6 +24,11 @@ func ParseString(dsl string) (*openfgav1.AuthorizationModel, error) {
 	return model, nil
 }
 
+func ValidateString(dsl string) error {
+	_, err := ParseString(dsl)
+	return err
+}
+
 func ValidateFile(path string) error {
 	_, err := ParseFile(path)
 	return err
