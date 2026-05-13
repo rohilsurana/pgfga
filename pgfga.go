@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "github.com/lib/pq"
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
@@ -13,15 +14,32 @@ import (
 	"github.com/rohilsurana/pgfga/transform"
 )
 
+type Option func(*Client)
+
+// WithSchema places all pgfga objects (authz_model table, check_permission
+// functions) into the given Postgres schema instead of public.
+// The schema is created automatically by Migrate() if it does not exist.
+//
+// Your authz_relationship view must be accessible from this schema's
+// search_path — either create it in the same schema or in public.
+func WithSchema(schema string) Option {
+	return func(c *Client) { c.schema = schema }
+}
+
 type Client struct {
-	db *sql.DB
+	db     *sql.DB
+	schema string
 }
 
-func New(db *sql.DB) *Client {
-	return &Client{db: db}
+func New(db *sql.DB, opts ...Option) *Client {
+	c := &Client{db: db}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
-func Connect(dsn string) (*Client, error) {
+func Connect(dsn string, opts ...Option) (*Client, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("pgfga: open: %w", err)
@@ -29,7 +47,11 @@ func Connect(dsn string) (*Client, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("pgfga: ping: %w", err)
 	}
-	return &Client{db: db}, nil
+	c := &Client{db: db}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c, nil
 }
 
 func (c *Client) DB() *sql.DB {
@@ -42,12 +64,22 @@ func (c *Client) Close() error {
 
 // Migrate creates the authz_model table and installs the check_permission
 // PL/pgSQL functions. Safe to call multiple times (uses IF NOT EXISTS and
-// CREATE OR REPLACE).
+// CREATE OR REPLACE). When WithSchema is configured, the schema is created
+// first and all objects are placed in it.
 func (c *Client) Migrate(ctx context.Context) error {
-	if _, err := c.db.ExecContext(ctx, pgfgasql.AuthzModelSQL); err != nil {
+	if c.schema != "" {
+		if _, err := c.db.ExecContext(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", quoteIdent(c.schema))); err != nil {
+			return fmt.Errorf("pgfga: create schema: %w", err)
+		}
+	}
+
+	tableSQL := c.qualifyAuthzModelSQL(pgfgasql.AuthzModelSQL)
+	if _, err := c.db.ExecContext(ctx, tableSQL); err != nil {
 		return fmt.Errorf("pgfga: create authz_model table: %w", err)
 	}
-	if _, err := c.db.ExecContext(ctx, pgfgasql.CheckPermissionSQL); err != nil {
+
+	funcSQL := c.qualifyCheckPermissionSQL(pgfgasql.CheckPermissionSQL)
+	if _, err := c.db.ExecContext(ctx, funcSQL); err != nil {
 		return fmt.Errorf("pgfga: install check_permission: %w", err)
 	}
 	return nil
@@ -65,8 +97,8 @@ type CheckRequest struct {
 // schema version.
 func (c *Client) Check(ctx context.Context, req CheckRequest) (bool, error) {
 	var allowed bool
-	err := c.db.QueryRowContext(ctx,
-		"SELECT check_permission($1, $2, $3, $4, $5)",
+	q := fmt.Sprintf("SELECT %s($1, $2, $3, $4, $5)", c.qualify("check_permission"))
+	err := c.db.QueryRowContext(ctx, q,
 		req.UserType, req.UserID, req.Relation, req.ObjectType, req.ObjectID,
 	).Scan(&allowed)
 	if err != nil {
@@ -78,8 +110,8 @@ func (c *Client) Check(ctx context.Context, req CheckRequest) (bool, error) {
 // CheckWithVersion calls check_permission with an explicit schema version.
 func (c *Client) CheckWithVersion(ctx context.Context, schemaVersion int64, req CheckRequest) (bool, error) {
 	var allowed bool
-	err := c.db.QueryRowContext(ctx,
-		"SELECT check_permission($1, $2, $3, $4, $5, $6)",
+	q := fmt.Sprintf("SELECT %s($1, $2, $3, $4, $5, $6)", c.qualify("check_permission"))
+	err := c.db.QueryRowContext(ctx, q,
 		schemaVersion, req.UserType, req.UserID, req.Relation, req.ObjectType, req.ObjectID,
 	).Scan(&allowed)
 	if err != nil {
@@ -118,20 +150,24 @@ func (c *Client) loadModel(ctx context.Context, schemaVersion int64, model *open
 		return fmt.Errorf("pgfga: no model rows generated")
 	}
 
+	table := c.qualify("authz_model")
+
 	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("pgfga: begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, "DELETE FROM authz_model WHERE schema_version = $1", schemaVersion); err != nil {
+	deleteQ := fmt.Sprintf("DELETE FROM %s WHERE schema_version = $1", table)
+	if _, err := tx.ExecContext(ctx, deleteQ, schemaVersion); err != nil {
 		return fmt.Errorf("pgfga: delete old version: %w", err)
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO authz_model (schema_version, entity_type, relation, subject_type, implied_by, parent_relation)
+	insertQ := fmt.Sprintf(`
+		INSERT INTO %s (schema_version, entity_type, relation, subject_type, implied_by, parent_relation)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`)
+	`, table)
+	stmt, err := tx.PrepareContext(ctx, insertQ)
 	if err != nil {
 		return fmt.Errorf("pgfga: prepare insert: %w", err)
 	}
@@ -153,7 +189,8 @@ func (c *Client) loadModel(ctx context.Context, schemaVersion int64, model *open
 // authz_model table, or 0 if no models exist.
 func (c *Client) GetLatestSchemaVersion(ctx context.Context) (int64, error) {
 	var version sql.NullInt64
-	err := c.db.QueryRowContext(ctx, "SELECT max(schema_version) FROM authz_model").Scan(&version)
+	q := fmt.Sprintf("SELECT max(schema_version) FROM %s", c.qualify("authz_model"))
+	err := c.db.QueryRowContext(ctx, q).Scan(&version)
 	if err != nil {
 		return 0, fmt.Errorf("pgfga: get latest version: %w", err)
 	}
@@ -161,4 +198,57 @@ func (c *Client) GetLatestSchemaVersion(ctx context.Context) (int64, error) {
 		return 0, nil
 	}
 	return version.Int64, nil
+}
+
+// qualify returns a schema-qualified identifier if a schema is configured,
+// otherwise returns the bare name.
+func (c *Client) qualify(name string) string {
+	if c.schema == "" {
+		return name
+	}
+	return quoteIdent(c.schema) + "." + name
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// qualifyAuthzModelSQL rewrites the embedded authz_model DDL to use the
+// configured schema.
+func (c *Client) qualifyAuthzModelSQL(src string) string {
+	if c.schema == "" {
+		return src
+	}
+	q := quoteIdent(c.schema)
+	s := src
+	// Qualify the table name in CREATE TABLE and ON clauses.
+	// Index names are NOT schema-qualified — Postgres places them in the
+	// same schema as their table automatically.
+	s = strings.ReplaceAll(s, `on "authz_model"`, `on `+q+`."authz_model"`)
+	s = strings.ReplaceAll(s, `exists "authz_model"`, `exists `+q+`."authz_model"`)
+	return s
+}
+
+// qualifyCheckPermissionSQL rewrites the embedded check_permission functions
+// to use the configured schema and sets the function search_path so internal
+// references to authz_model and authz_relationship resolve correctly.
+func (c *Client) qualifyCheckPermissionSQL(src string) string {
+	if c.schema == "" {
+		return src
+	}
+	q := quoteIdent(c.schema)
+	searchPath := fmt.Sprintf("SET search_path = %s, public", q)
+
+	s := src
+	// Qualify function names in CREATE OR REPLACE
+	s = strings.ReplaceAll(s, "function check_permission(", "function "+q+".check_permission(")
+
+	// Qualify the authz_model composite type used as a function parameter
+	s = strings.ReplaceAll(s, "authz_model[]", q+".authz_model[]")
+
+	// Add search_path to each function so internal references to
+	// authz_model (table) and authz_relationship (view) resolve within
+	// the configured schema first, then public.
+	s = strings.ReplaceAll(s, "$$ language plpgsql;", "$$ language plpgsql\n"+searchPath+";")
+	return s
 }

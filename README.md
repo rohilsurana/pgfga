@@ -1,152 +1,302 @@
 # pgFGA
 
-pgFGA is a pure-Postgres implementation of parts of [OpenFGA](https://openfga.dev/).
+pgFGA is a pure-Postgres fine-grained authorization library for Go, implementing parts of [OpenFGA](https://openfga.dev/). It parses `.fga` schema files natively using the [openfga/language](https://github.com/openfga/language) package — no external CLI or sidecar needed.
 
-This is a Go port of the original [pgFGA](https://github.com/isaacharrisholt/pgfga) project. It replaces the TypeScript/Bun scripts and the OpenFGA CLI dependency with a Go library and CLI that parses `.fga` files natively using the [openfga/language](https://github.com/openfga/language) package.
+Forked from [isaacharrisholt/pgfga](https://github.com/isaacharrisholt/pgfga) and rewritten in Go.
 
 ## Requirements
 
 - Go 1.25+
-- PostgreSQL database
+- PostgreSQL 14+
 
-## Library Usage
+## Install
 
-```go
-import "github.com/rohilsurana/pgfga"
+```bash
+go get github.com/rohilsurana/pgfga
 ```
 
-### Initialize
+## Quick Start
 
-```go
-// From an existing *sql.DB
-client := pgfga.New(db)
+Here is a complete working example — from schema definition to permission checks.
 
-// Or connect directly
-client, err := pgfga.Connect("postgres://user:pass@localhost:5432/mydb?sslmode=disable")
-if err != nil {
-    log.Fatal(err)
-}
-defer client.Close()
+### 1. Define your authorization model
+
+Create a `schema.fga` file using [OpenFGA DSL](https://openfga.dev/docs/configuration-language):
+
 ```
-
-### Migrate (create tables + install PL/pgSQL functions)
-
-```go
-if err := client.Migrate(ctx); err != nil {
-    log.Fatal(err)
-}
-```
-
-This creates the `authz_model` table and installs the `check_permission` functions. Safe to call multiple times.
-
-### Load an authorization model
-
-```go
-// From a DSL string
-dsl := `model
+model
   schema 1.1
 
 type user
 
-type document
+type organization
   relations
-    define viewer: [user]
-    define editor: [user] or viewer
-`
-err := client.LoadModelDSL(ctx, 1, dsl)
+    define owner: [user]
+    define admin: [user] or owner
+    define member: [user] or admin
+    define can_read: member
+    define can_edit: admin
+    define can_delete: owner
 
-// Or from a .fga file
-err := client.LoadModelFile(ctx, 1, "schemas/v001/schema.fga")
+type project
+  relations
+    define organization: [organization]
+    define editor: [user]
+    define viewer: [user] or editor
+    define can_read: member from organization
+    define can_edit: editor
+    define can_delete: can_edit
 ```
 
-### Check permissions
+This defines: users can be owners/admins/members of organizations, and projects inherit read access from org membership while having their own editor/viewer roles.
+
+### 2. Set up pgfga and load the model
 
 ```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "log"
+
+    _ "github.com/lib/pq"
+    "github.com/rohilsurana/pgfga"
+)
+
+func main() {
+    ctx := context.Background()
+    db, _ := sql.Open("postgres", "postgres://user:pass@localhost:5432/mydb?sslmode=disable")
+
+    // Create a pgfga client. Use WithSchema to isolate pgfga objects
+    // into a dedicated Postgres schema instead of public.
+    client := pgfga.New(db, pgfga.WithSchema("authz"))
+
+    // Migrate creates the authz_model table and installs the
+    // check_permission PL/pgSQL functions. Idempotent — safe to call
+    // on every application startup.
+    if err := client.Migrate(ctx); err != nil {
+        log.Fatal(err)
+    }
+
+    // Load your authorization model from a DSL string.
+    // The first argument is the schema version number.
+    dsl := `model
+  schema 1.1
+
+type user
+
+type organization
+  relations
+    define owner: [user]
+    define admin: [user] or owner
+    define member: [user] or admin
+    define can_read: member
+    define can_edit: admin
+    define can_delete: owner
+
+type project
+  relations
+    define organization: [organization]
+    define editor: [user]
+    define viewer: [user] or editor
+    define can_read: member from organization
+    define can_edit: editor
+    define can_delete: can_edit
+`
+    if err := client.LoadModelDSL(ctx, 1, dsl); err != nil {
+        log.Fatal(err)
+    }
+
+    // Or load from a file:
+    // client.LoadModelFile(ctx, 1, "schemas/v001/schema.fga")
+}
+```
+
+### 3. Create the `authz_relationship` view
+
+pgfga checks permissions by querying a view called `authz_relationship` that maps your application data to authorization tuples. You define this view yourself, pointing at your existing tables.
+
+```sql
+-- If using WithSchema("authz"), create the view in the same schema.
+CREATE VIEW authz.authz_relationship AS
+
+-- Organization memberships (direct role assignments)
+SELECT
+    user_id,
+    'user' AS user_type,
+    role AS relation,           -- 'owner', 'admin', or 'member'
+    org_id AS object_id,
+    'organization' AS object_type
+FROM org_memberships
+
+UNION ALL
+
+-- Project -> Organization parent link (for inherited permissions)
+SELECT
+    id AS user_id,
+    'project' AS user_type,
+    'organization' AS relation,
+    org_id AS object_id,
+    'organization' AS object_type
+FROM projects
+
+UNION ALL
+
+-- Project memberships (direct role assignments)
+SELECT
+    user_id,
+    'user' AS user_type,
+    role AS relation,           -- 'editor' or 'viewer'
+    project_id AS object_id,
+    'project' AS object_type
+FROM project_memberships;
+```
+
+The view must have exactly these columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `user_id` | text | The subject (user or parent resource ID) |
+| `user_type` | text | The subject type (`user`, `project`, etc.) |
+| `relation` | text | The relation name (`owner`, `member`, `organization`, etc.) |
+| `object_id` | text | The target object ID |
+| `object_type` | text | The target object type |
+
+### 4. Check permissions
+
+```go
+// Can alice read the organization?
 allowed, err := client.Check(ctx, pgfga.CheckRequest{
     UserType:   "user",
     UserID:     "alice",
-    Relation:   "viewer",
-    ObjectType: "document",
-    ObjectID:   "doc-1",
+    Relation:   "can_read",
+    ObjectType: "organization",
+    ObjectID:   "acme",
+})
+// allowed == true (if alice is owner, admin, or member of acme)
+
+// Can bob edit the project? (checks direct editor role)
+allowed, err = client.Check(ctx, pgfga.CheckRequest{
+    UserType:   "user",
+    UserID:     "bob",
+    Relation:   "can_edit",
+    ObjectType: "project",
+    ObjectID:   "proj-1",
 })
 
-// With explicit schema version
-allowed, err := client.CheckWithVersion(ctx, 1, pgfga.CheckRequest{
+// Can carol read the project? (traverses project -> org -> member)
+allowed, err = client.Check(ctx, pgfga.CheckRequest{
+    UserType:   "user",
+    UserID:     "carol",
+    Relation:   "can_read",
+    ObjectType: "project",
+    ObjectID:   "proj-1",
+})
+
+// Pin to a specific schema version (recommended for production)
+allowed, err = client.CheckWithVersion(ctx, 1, pgfga.CheckRequest{
     UserType:   "user",
     UserID:     "alice",
-    Relation:   "viewer",
-    ObjectType: "document",
-    ObjectID:   "doc-1",
+    Relation:   "can_delete",
+    ObjectType: "organization",
+    ObjectID:   "acme",
 })
 ```
+
+## How it works
+
+pgfga stores your authorization model in a Postgres table and evaluates permissions using a recursive PL/pgSQL function — no external service needed.
+
+```
+Your .fga schema          pgfga library          Postgres
+─────────────────     ─────────────────────     ──────────────────────
+                      parser.ParseString()
+  model               ──────────────────>       authz_model table
+    schema 1.1                                  (stores the schema)
+  type user            transform.Generate()
+  type org             ──────────────────>
+    define owner                                check_permission()
+    define admin                                (recursive PL/pgSQL)
+                       client.Check()
+                       ──────────────────>       authz_relationship
+                                                (your view, your data)
+```
+
+1. **Parse**: `.fga` DSL is parsed into protobuf types via `openfga/language`
+2. **Transform**: Protobuf model is converted to `authz_model` rows (entity_type, relation, subject_type, implied_by, parent_relation)
+3. **Check**: `check_permission()` recursively walks the model, querying your `authz_relationship` view to resolve direct assignments, role hierarchies, and parent-child inheritance
+
+## API Reference
+
+### Client
+
+```go
+// Create from existing *sql.DB
+client := pgfga.New(db)
+client := pgfga.New(db, pgfga.WithSchema("authz"))
+
+// Or connect directly
+client, err := pgfga.Connect(dsn)
+client, err := pgfga.Connect(dsn, pgfga.WithSchema("authz"))
+
+client.DB()    // access underlying *sql.DB
+client.Close() // close the connection (only if created via Connect)
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `pgfga.WithSchema(name)` | Place all pgfga objects in a dedicated Postgres schema. Created automatically by `Migrate()`. |
+
+### Methods
+
+| Method | Description |
+|---|---|
+| `Migrate(ctx)` | Create `authz_model` table + install `check_permission` functions. Idempotent. |
+| `LoadModelDSL(ctx, version, dsl)` | Parse DSL string and upsert authorization model at given version. |
+| `LoadModelFile(ctx, version, path)` | Parse `.fga` file and upsert authorization model at given version. |
+| `Check(ctx, req)` | Check permission using the latest schema version. |
+| `CheckWithVersion(ctx, version, req)` | Check permission using a specific schema version. |
+| `GetLatestSchemaVersion(ctx)` | Get the highest schema version number, or 0. |
 
 ### Sub-packages
 
-For advanced use, the parser and transform packages are importable directly:
+| Package | Import | Use |
+|---|---|---|
+| `parser` | `github.com/rohilsurana/pgfga/parser` | Parse/validate `.fga` files without a database |
+| `transform` | `github.com/rohilsurana/pgfga/transform` | Convert parsed models to `authz_model` rows |
+| `sql` | `github.com/rohilsurana/pgfga/sql` | Access embedded SQL (table DDL, function definitions) |
 
-```go
-import (
-    "github.com/rohilsurana/pgfga/parser"
-    "github.com/rohilsurana/pgfga/transform"
-)
+## CLI
 
-model, err := parser.ParseFile("schema.fga")
-rows, err := transform.GenerateAuthzModel(1, model)
-```
-
-## CLI Usage
-
-### Install
+A thin CLI wrapper is included for schema management workflows.
 
 ```bash
 go install github.com/rohilsurana/pgfga/cmd/pgfga@latest
 ```
 
-### Commands
-
 ```
-pgfga validate              Validate all .fga schemas
-pgfga new                   Create a new WIP schema from the latest version
-pgfga finalize              Promote WIP schema to a versioned schema
-pgfga migrate [--dsn=...]   Migrate the database to the latest schema version
+pgfga validate                             Validate all .fga schemas
+pgfga new                                  Create WIP schema from latest version
+pgfga finalize                             Promote WIP to next version number
+pgfga migrate [--dsn=...] [--schema=...]   Apply schema to database
 ```
 
-### Environment variables
-
-| Variable | Description |
-|---|---|
-| `PGFGA_DSN` | Postgres connection string (for `migrate`) |
-| `PGFGA_LOCAL` | Set to `true` to include WIP schemas in migration |
-
-### Workflow
-
-1. `pgfga new` — copies the latest schema into `schemas/wip/`
-2. Edit `schemas/wip/schema.fga`
-3. `pgfga validate` — check all schemas parse correctly
-4. `pgfga finalize` — promotes WIP to next version number
-5. `pgfga migrate --dsn=...` — applies the schema to the database
-
-## `authz_relationship` view
-
-You must create an `authz_relationship` view in your database that maps your application's data to authorization tuples. The view must have these columns:
-
-| Column | Type | Description |
+| Variable | Flag | Description |
 |---|---|---|
-| `user_id` | text | The subject's ID |
-| `user_type` | text | The subject's type |
-| `relation` | text | The relation name |
-| `object_id` | text | The object's ID |
-| `object_type` | text | The object's type |
+| `PGFGA_DSN` | `--dsn` | Postgres connection string |
+| `PGFGA_SCHEMA` | `--schema` | Postgres schema for pgfga objects |
+| `PGFGA_LOCAL` | | Set `true` to include WIP schemas |
 
-Example:
+### Schema versioning workflow
 
-```sql
-CREATE VIEW authz_relationship AS
-SELECT user_id, 'user' AS user_type, role AS relation,
-       org_id AS object_id, 'organization' AS object_type
-FROM org_memberships
-UNION ALL
-SELECT id AS user_id, 'repository' AS user_type, 'organization' AS relation,
-       org_id AS object_id, 'organization' AS object_type
-FROM repositories;
+```bash
+pgfga new                    # copies latest schema to schemas/wip/
+vim schemas/wip/schema.fga   # edit the model
+pgfga validate               # check all schemas parse correctly
+pgfga finalize               # schemas/wip/ -> schemas/v001/
+pgfga migrate --dsn=...      # apply to database
 ```

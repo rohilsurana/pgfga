@@ -46,10 +46,12 @@ Usage:
   pgfga validate              Validate all .fga schemas
   pgfga new                   Create a new WIP schema from the latest version
   pgfga finalize              Promote WIP schema to a versioned schema
-  pgfga migrate [--dsn=...]   Migrate the database to the latest schema version
+  pgfga migrate [--dsn=...] [--schema=...]
+                              Migrate the database to the latest schema version
 
 Environment:
   PGFGA_DSN          Postgres connection string (for migrate)
+  PGFGA_SCHEMA       Postgres schema for pgfga objects (default: public)
   PGFGA_LOCAL=true   Enable local mode (includes WIP schemas in migrate)
 `)
 }
@@ -241,19 +243,28 @@ func cmdFinalize() error {
 
 func cmdMigrate() error {
 	dsn := os.Getenv("PGFGA_DSN")
+	pgSchema := os.Getenv("PGFGA_SCHEMA")
 	for _, arg := range os.Args[2:] {
 		if strings.HasPrefix(arg, "--dsn=") {
 			dsn = strings.TrimPrefix(arg, "--dsn=")
+		}
+		if strings.HasPrefix(arg, "--schema=") {
+			pgSchema = strings.TrimPrefix(arg, "--schema=")
 		}
 	}
 	if dsn == "" {
 		return fmt.Errorf("PGFGA_DSN or --dsn required")
 	}
 
+	var opts []pgfga.Option
+	if pgSchema != "" {
+		opts = append(opts, pgfga.WithSchema(pgSchema))
+	}
+
 	isLocal := os.Getenv("PGFGA_LOCAL") == "true"
 	ctx := context.Background()
 
-	client, err := pgfga.Connect(dsn)
+	client, err := pgfga.Connect(dsn, opts...)
 	if err != nil {
 		return err
 	}
