@@ -2,80 +2,97 @@
 
 pgFGA is a pure-Postgres implementation of parts of [OpenFGA](https://openfga.dev/).
 
-Read more about pgFGA in the [blog post](#TODO).
+This is a Go port of the original [pgFGA](https://github.com/isaacharrisholt/pgfga) project. It replaces the TypeScript/Bun scripts and the OpenFGA CLI dependency with a single Go binary that parses `.fga` files natively using the [openfga/language](https://github.com/openfga/language) package.
 
 ## Requirements
 
-The only thing you need to use pgFGA is a PostgreSQL database, though the
-convenience scripts in this repo also require:
-
-- [The OpenFGA CLI](https://github.com/openfga/cli?tab=readme-ov-file#installation)
+- Go 1.25+
+- PostgreSQL database
 
 ## Getting set up
 
-The [`pgfga`](./pgfga) directory contains all the source code you need to add
-pgFGA to your PostgreSQL database.
+### Install the CLI
 
-- `authz_model.sql` contains the DDL for defining the `authz_model` table. This
-  holds your authorization model schema, and is versioned using the
-  `schema_version` column.
-- `check_permission.sql` contains the three PL/pgSQL functions you can use to
-  check user permissions. These will be described in more detail below.
-- `authz_relationship_example.sql` contains an example of how you might define
-  the `authz_relationship` view to map data in your database to your
-  authorization model.
+```bash
+go install github.com/rohilsurana/pgfga/cmd/pgfga@latest
+```
 
-Simply run these in your DB and you'll be good to go!
+Or build from source:
 
-### Convenience scripts
+```bash
+go build -o pgfga ./cmd/pgfga
+```
 
-The [`scripts`](./scripts) directory contains a few scripts that can help you
-get started with pgFGA. These are run using the Bun JavaScript runtime, and use
-Drizzle ORM to interact with the database. So far, they've been copied wholesale
-from our internal monorepo, and no effort has been made to generalise them.
+### SQL files
 
-Regardless, the scripts are:
+The [`pgfga`](./pgfga) directory contains the SQL you need:
 
-- `new.ts` - copies the latest schema from [`schemas`](./schemas) into a new
-  `schemas/wip` directory. A schema has been provided in
-  [`schemas/v000/schema.fga`](./schemas/v000/schema.fga) as an example.
-- `finalize.ts` - changes the WIP schema to a finalized schema, and gives it a
-  version number.
-- `migrate.ts` - migrates the database to the latest schema version. If not
-  running locally, will ignore any WIP schemas.
-- `validate-all.ts` - uses the OpenFGA CLI to validate all schemas in the
-  `schemas` directory.
+- `authz_model.sql` — DDL for the `authz_model` table (auto-created by `migrate`)
+- `check_permission.sql` — PL/pgSQL functions for checking permissions
 
-Feel free to adapt the scripts to your needs.
+Run `check_permission.sql` in your database after the first migration.
+
+## CLI Usage
+
+```
+pgfga validate              Validate all .fga schemas
+pgfga new                   Create a new WIP schema from the latest version
+pgfga finalize              Promote WIP schema to a versioned schema
+pgfga migrate [--dsn=...]   Migrate the database to the latest schema version
+```
+
+### Environment variables
+
+| Variable | Description |
+|---|---|
+| `PGFGA_DSN` | Postgres connection string (for `migrate`) |
+| `PGFGA_LOCAL` | Set to `true` to include WIP schemas in migration |
+
+### Workflow
+
+1. `pgfga new` — copies the latest schema into `schemas/wip/`
+2. Edit `schemas/wip/schema.fga`
+3. `pgfga validate` — check all schemas parse correctly
+4. `pgfga finalize` — promotes WIP to next version number
+5. `pgfga migrate --dsn=...` — applies the schema to the database
 
 ## `check_permission`
 
-The [`check_permission.sql`](./pgfga/check_permission.sql) file contains three
-PL/pgSQL functions you can use to check user permissions.
-
-You'll mostly be interacting with two of them:
+The `check_permission.sql` file provides three PL/pgSQL function overloads:
 
 ```sql
-check_permission(
-    p_schema_version bigint,
-    p_user_type text,
-    p_user_id text,
-    p_relation text,
-    p_object_type text,
-    p_object_id text
-) returns boolean;
+-- With explicit schema version (recommended for production)
+check_permission(p_schema_version bigint, p_user_type text, p_user_id text,
+                 p_relation text, p_object_type text, p_object_id text)
+    returns boolean;
 
-check_permission(
-    p_user_type text,
-    p_user_id text,
-    p_relation text,
-    p_object_type text,
-    p_object_id text
-)
-returns boolean;
+-- Uses latest schema version (convenient for development)
+check_permission(p_user_type text, p_user_id text,
+                 p_relation text, p_object_type text, p_object_id text)
+    returns boolean;
 ```
 
-The former takes a schema version as its first argument, while the latter
-function will use the latest schema version, which is useful for local
-development. We recommend keeping your schema version in an environment variable
-or a configuration file.
+## `authz_relationship` view
+
+You must create an `authz_relationship` view in your database that maps your application's data to authorization tuples. The view must have these columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `user_id` | text | The subject's ID |
+| `user_type` | text | The subject's type |
+| `relation` | text | The relation name |
+| `object_id` | text | The object's ID |
+| `object_type` | text | The object's type |
+
+Example:
+
+```sql
+CREATE VIEW authz_relationship AS
+SELECT user_id, 'user' AS user_type, role AS relation,
+       org_id AS object_id, 'organization' AS object_type
+FROM org_memberships
+UNION ALL
+SELECT id AS user_id, 'repository' AS user_type, 'organization' AS relation,
+       org_id AS object_id, 'organization' AS object_type
+FROM repositories;
+```
