@@ -232,20 +232,104 @@ Your .fga schema          pgfga library          Postgres
 2. **Transform**: Protobuf model is converted to `authz_model` rows (entity_type, relation, subject_type, implied_by, parent_relation)
 3. **Check**: `check_permission()` recursively walks the model, querying your `authz_relationship` view to resolve direct assignments, role hierarchies, and parent-child inheritance
 
+## Using with transactions
+
+`pgfga.New()` accepts any `DBTX` — an interface satisfied by `*sql.DB`, `*sql.Tx`, `*sqlx.DB`, `*sqlx.Tx`, and pgx stdlib connections. Use `WithTx()` to run permission checks inside an existing transaction:
+
+```go
+tx, _ := db.BeginTx(ctx, nil)
+defer tx.Rollback()
+
+// Application logic inside the transaction
+tx.ExecContext(ctx, "INSERT INTO orders (...) VALUES (...)")
+
+// Permission check in the same transaction
+txClient := client.WithTx(tx)
+allowed, _ := txClient.Check(ctx, pgfga.CheckRequest{
+    UserType:   "user",
+    UserID:     "alice",
+    Relation:   "can_edit",
+    ObjectType: "organization",
+    ObjectID:   "acme",
+})
+if !allowed {
+    tx.Rollback()
+    return ErrForbidden
+}
+
+// Load a new model version as part of a transaction
+txClient.LoadModelDSL(ctx, 2, newDSL)
+
+tx.Commit()
+```
+
+When `LoadModelDSL`/`LoadModelFile` is called on a `WithTx()` client, it executes directly on that transaction — no nested transaction is created. When called on a `New(db)` client, it automatically wraps the operation in its own transaction.
+
+## Database library compatibility
+
+pgfga works with any Go database library that implements the `DBTX` interface:
+
+```go
+type DBTX interface {
+    ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+    QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+```
+
+### database/sql (standard library)
+
+```go
+db, _ := sql.Open("postgres", dsn)
+client := pgfga.New(db)
+```
+
+### sqlx
+
+```go
+db, _ := sqlx.Connect("postgres", dsn)
+client := pgfga.New(db.DB) // sqlx.DB embeds *sql.DB
+
+// Works with sqlx transactions too
+tx, _ := db.BeginTxx(ctx, nil)
+txClient := client.WithTx(tx.Tx) // sqlx.Tx embeds *sql.Tx
+```
+
+### pgx (stdlib mode)
+
+```go
+import "github.com/jackc/pgx/v5/stdlib"
+
+db := stdlib.OpenDB(connConfig)
+client := pgfga.New(db)
+```
+
+### pgxpool (stdlib adapter)
+
+```go
+import "github.com/jackc/pgx/v5/stdlib"
+
+pool, _ := pgxpool.New(ctx, dsn)
+db := stdlib.OpenDBFromPool(pool)
+client := pgfga.New(db)
+```
+
 ## API Reference
 
 ### Client
 
 ```go
-// Create from existing *sql.DB
+// Create from any DBTX (*sql.DB, *sql.Tx, *sqlx.DB, etc.)
 client := pgfga.New(db)
 client := pgfga.New(db, pgfga.WithSchema("authz"))
 
-// Or connect directly
+// Or connect directly (creates a *sql.DB internally)
 client, err := pgfga.Connect(dsn)
 client, err := pgfga.Connect(dsn, pgfga.WithSchema("authz"))
 
-client.DB()    // access underlying *sql.DB
+// Derive a transaction-scoped client
+txClient := client.WithTx(tx)
+
+client.DB()    // access underlying DBTX
 client.Close() // close the connection (only if created via Connect)
 ```
 
@@ -265,6 +349,7 @@ client.Close() // close the connection (only if created via Connect)
 | `Check(ctx, req)` | Check permission using the latest schema version. |
 | `CheckWithVersion(ctx, version, req)` | Check permission using a specific schema version. |
 | `GetLatestSchemaVersion(ctx)` | Get the highest schema version number, or 0. |
+| `WithTx(tx)` | Return a new Client bound to the given transaction. Caller owns the tx lifecycle. |
 
 ### Sub-packages
 
